@@ -1,0 +1,33 @@
+# Wildlife Conflict Mitigation System - Configuration Template
+# Copy this file to settings.yaml and customize for your setup
+
+models:
+  default: "yolov8n.pt"
+  custom: "runs/detect/wildlife_multi_v5/weights/best.pt"  # Update with your custom model path
+
+active_mode: "custom"  # Options: default, custom, cascade
+
+target_classes:
+  - cheetah
+  - crocodile
+  - giraffe
+  - rhino
+  - elephant
+  - bear
+  - tiger
+  - dog
+  - bird
+  - person
+
+video_source: "0"  # Camera index (e.g., "0", "1") or RTSP URL (e.g., "rtsp://192.168.1.100:554/stream")
+device: "cpu"       # Use "cpu" or "cuda" for GPU acceleration
+
+# Region of Interest coordinates [x, y] for 4 corners (quadrilateral)
+roi_coordinates:
+  - [100, 100]
+  - [500, 100]
+  - [500, 400]
+  - [100, 400]
+
+# Cooldown period between alerts for same animal class (seconds)
+alert_cooldown_sec: 10

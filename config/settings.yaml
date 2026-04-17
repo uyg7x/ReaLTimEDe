@@ -1,0 +1,28 @@
+models:
+  default: "yolov8n.pt"
+  custom: "runs/detect/wildlife_multi_v5/weights/best.pt"
+
+active_mode: "custom"
+
+target_classes:
+  - cheetah
+  - crocodile
+  - giraffe
+  - rhino
+  - elephant
+  - bear
+  - tiger
+  - dog
+  - bird
+  - person
+
+video_source: "0"
+device: "cpu"
+
+roi_coordinates:
+  - [100, 100]
+  - [500, 100]
+  - [500, 400]
+  - [100, 400]
+
+alert_cooldown_sec: 10
