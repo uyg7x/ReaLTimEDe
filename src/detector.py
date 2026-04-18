@@ -2,235 +2,211 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import os
-from collections import defaultdict
-import logging
+from collections import defaultdict, deque
 
 class WildlifeDetector:
     def __init__(self, models_config: dict, target_classes: list, device: str = "cpu", active_mode: str = "default"):
+        """
+        Initialize dual-model wildlife detector with strict filtering.
+        
+        Args:
+            models_config: dict with model names and paths/names
+            target_classes: list of class names to detect
+            device: "cpu" or "cuda"
+            active_mode: "default", "custom", or "cascade"
+        """
         self.target_classes = [c.lower() for c in target_classes]
         self.device = device
         self.active_mode = active_mode
         self.models = {}
         self.class_names = {}
-        self.logger = logging.getLogger(__name__)
         
-        # 🔹 STRICT per-class confidence thresholds (INCREASED for accuracy)
+        # 🔹 STRICT per-class confidence thresholds (tune these!)
         self.conf_thresholds = {
-            "cheetah": 0.65,
-            "crocodile": 0.70,
-            "giraffe": 0.70,
-            "rhino": 0.65,
-            "elephant": 0.70,
-            "bear": 0.65,
-            "tiger": 0.70,
-            "leopard": 0.65,
-            "dog": 0.80,       # Very High: block false dogs
-            "person": 0.60,
-            "bird": 0.55,
-            "boar": 0.65,
-            "truck": 0.60,
-            "default": 0.55    # Increased from 0.45
+            # Land mammals
+            "dog": 0.75, "cat": 0.70, "elephant": 0.65, "bear": 0.60, 
+            "tiger": 0.65, "leopard": 0.60, "lion": 0.65, "cheetah": 0.60,
+            "giraffe": 0.60, "rhino": 0.65, "hippo": 0.65, "boar": 0.55,
+            "sheep": 0.50, "cow": 0.50, "horse": 0.50, "zebra": 0.55,
+            # Birds
+            "bird": 0.50, "eagle": 0.55, "owl": 0.55,
+            # Water animals
+            "crocodile": 0.65, "alligator": 0.65, "turtle": 0.55, 
+            "fish": 0.45, "frog": 0.50,
+            # Vehicles & objects
+            "truck": 0.50, "car": 0.50, "motorcycle": 0.50, "bicycle": 0.45,
+            "bottle": 0.40, "cup": 0.40, "fork": 0.40, "knife": 0.40, "spoon": 0.40,
+            # Default fallback
+            "person": 0.50,
+            "default": 0.45
         }
 
-        # 🔹 Size & Aspect Ratio Filters (pixels) - ADJUSTED
-        self.size_filters = {
-            "dog": {"min_w": 60, "min_h": 50, "max_ratio": 2.5},
-            "bear": {"min_w": 80, "min_h": 60, "max_ratio": 2.5},
-            "tiger": {"min_w": 80, "min_h": 60, "max_ratio": 2.8},
-            "leopard": {"min_w": 70, "min_h": 50, "max_ratio": 2.8},
-            "elephant": {"min_w": 120, "min_h": 80, "max_ratio": 2.0},
-            "cheetah": {"min_w": 70, "min_h": 50, "max_ratio": 3.0},
-            "giraffe": {"min_w": 80, "min_h": 100, "max_ratio": 2.0},
-            "rhino": {"min_w": 100, "min_h": 70, "max_ratio": 2.5},
-            "crocodile": {"min_w": 80, "min_h": 40, "max_ratio": 4.0},
-            "boar": {"min_w": 60, "min_h": 40, "max_ratio": 2.5},
+        # 🔹 Shape/Size Filters (width, height, min_area, max_aspect_ratio)
+        # aspect_ratio = width / height
+        self.shape_filters = {
+            "giraffe":    {"min_h": 100, "min_w": 30, "max_ar": 0.5},   # Tall & thin
+            "crocodile":  {"min_w": 60,  "min_h": 15, "max_ar": 6.0},   # Long & flat
+            "alligator":  {"min_w": 60,  "min_h": 15, "max_ar": 6.0},
+            "elephant":   {"min_area": 4000, "max_ar": 2.0},
+            "bear":       {"min_area": 1200, "max_ar": 2.5},
+            "tiger":      {"min_area": 1000, "max_ar": 3.0},
+            "leopard":    {"min_area": 800,  "max_ar": 3.0},
+            "lion":       {"min_area": 1000, "max_ar": 3.0},
+            "cheetah":    {"min_area": 800,  "max_ar": 3.5},
+            "rhino":      {"min_area": 2000, "max_ar": 2.0},
+            "hippo":      {"min_area": 2500, "max_ar": 2.0},
+            "dog":        {"min_area": 600,  "max_ar": 3.0},
+            "cat":        {"min_area": 400,  "max_ar": 3.0},
+            "bird":       {"min_area": 200,  "max_ar": 4.0},
+            "turtle":     {"min_area": 300,  "max_ar": 2.0},
+            "fish":       {"min_area": 400,  "max_ar": 5.0},
+            "frog":       {"min_area": 150,  "max_ar": 2.5},
         }
 
-        # 🔹 Temporal Consistency (track last 5 frames)
-        self.frame_history = defaultdict(list)
-        self.consistency_threshold = 3
+        # 🔹 Temporal Consistency (require N consecutive frames to trigger alert)
+        self.history = {cls: deque(maxlen=3) for cls in target_classes}
+        self.consistency_required = {"bird": 2, "fish": 3, "frog": 3, "default": 3}
 
-        # Load models
+        # 🔹 Load models (YOLO auto-downloads if path is a model name)
+        print("🔧 Loading detection models...")
         for name, path in models_config.items():
-            if os.path.exists(path):
+            try:
+                # YOLO() accepts both file paths AND model names (auto-downloads from Ultralytics)
                 self.models[name] = YOLO(path)
                 self.class_names[name] = self.models[name].names
-                print(f"✅ Loaded model: {name}")
-            else:
-                print(f"⚠️ Missing model: {path}")
+                print(f"✅ Loaded model: {name} ({path})")
+            except Exception as e:
+                print(f"⚠️ Failed to load {name} ({path}): {e}")
 
         if not self.models:
-            raise RuntimeError("No models loaded. Check paths.")
+            raise RuntimeError("❌ No models loaded. Check paths or internet connection.")
 
+        # 🔹 Preprocessing for low-light/jungle conditions
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
 
     def _preprocess(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        enhanced = self.clahe.apply(gray)
-        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        return cv2.addWeighted(frame, 0.4, enhanced_bgr, 0.6, 0)
+        """Enhance visibility in low-light, foggy, or canopy-covered conditions."""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            enhanced = self.clahe.apply(gray)
+            enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+            # Blend 50% original + 50% enhanced for natural look
+            return cv2.addWeighted(frame, 0.5, enhanced_bgr, 0.5, 0)
+        except:
+            return frame  # Fallback to original if preprocessing fails
 
-    def _passes_filters(self, cls: str, bbox: list) -> bool:
-        if cls not in self.size_filters:
-            return True
+    def _passes_shape_filter(self, cls: str, bbox: list) -> bool:
+        """Reject detections that don't match expected animal proportions."""
+        if cls not in self.shape_filters:
+            return True  # No filter = accept
         x1, y1, x2, y2 = bbox
-        w, h = x2-x1, y2-y1
-        filt = self.size_filters[cls]
-        if w < filt["min_w"] or h < filt["min_h"]:
+        w, h = max(1, x2-x1), max(1, y2-y1)
+        filt = self.shape_filters[cls]
+        
+        if "min_area" in filt and (w * h) < filt["min_area"]:
             return False
-        if w/h > filt["max_ratio"] or h/w > filt["max_ratio"]:
+        if "min_w" in filt and w < filt["min_w"]:
             return False
+        if "min_h" in filt and h < filt["min_h"]:
+            return False
+        if "max_ar" in filt:
+            ar = w / h
+            if ar > filt["max_ar"] or (1/ar) > filt["max_ar"]:
+                return False
         return True
 
+    def _temporal_check(self, cls: str, bbox: list) -> bool:
+        """Require consistent detection across N frames before alerting."""
+        hist = self.history[cls]
+        hist.append(bbox)
+        required = self.consistency_required.get(cls, self.consistency_required["default"])
+        return len(hist) == required
+
     def detect(self, frame):
-        proc = self._preprocess(frame)
-        raw_dets = []
-
-        if self.active_mode == "default":
-            raw_dets = self._run("default", proc)
-        elif self.active_mode == "custom":
-            raw_dets = self._run("custom", proc)
-        elif self.active_mode == "cascade":
-            raw_dets = self._run_cascade(proc)
-
-        # 🔹 Apply strict filtering + temporal consistency
-        final = []
-        filtered_count = {"confidence": 0, "size": 0, "consistency": 0}
+        """
+        Run detection with preprocessing, filtering, and temporal consistency.
         
-        for det in raw_dets:
+        Returns:
+            list of detections: [{"class": str, "confidence": float, "bbox": [x1,y1,x2,y2]}]
+        """
+        proc_frame = self._preprocess(frame)
+        raw_detections = []
+
+        # Run model(s) based on active_mode
+        if self.active_mode in ["default", "cascade"]:
+            raw_detections += self._run_model("default", proc_frame)
+        if self.active_mode in ["custom", "cascade"]:
+            raw_detections += self._run_model("custom", proc_frame)
+
+        # Apply strict filtering + temporal consistency
+        final_detections = []
+        for det in raw_detections:
             cls, conf, bbox = det["class"], det["confidence"], det["bbox"]
-            thresh = self.conf_thresholds.get(cls, self.conf_thresholds["default"])
             
-            # Step 1: Filter by confidence
-            if conf < thresh:
-                filtered_count["confidence"] += 1
+            # Skip if not in target list
+            if cls not in self.target_classes:
                 continue
             
-            # Step 2: Filter by size/aspect ratio
-            if not self._passes_filters(cls, bbox):
-                filtered_count["size"] += 1
+            # Apply class-specific confidence threshold
+            threshold = self.conf_thresholds.get(cls, self.conf_thresholds["default"])
+            if conf < threshold:
+                continue
+            
+            # Apply shape/size filter
+            if not self._passes_shape_filter(cls, bbox):
+                continue
+            
+            # Apply temporal consistency check
+            if not self._temporal_check(cls, bbox):
                 continue
 
-            # Step 3: Temporal consistency check - verify detection appears in same area
-            is_consistent = self._check_temporal_consistency(cls, bbox)
-            
-            if not is_consistent:
-                filtered_count["consistency"] += 1
-                continue
-                
-            final.append(det)
-        
-        # Log detection stats every 60 frames
-        if raw_dets and len(raw_dets) > 0:
-            self.logger.debug(f"Detection stats: {len(raw_dets)} raw → {len(final)} final | " +
-                            f"conf:{filtered_count['confidence']} size:{filtered_count['size']} " +
-                            f"consistency:{filtered_count['consistency']}")
-        
-        return final
+            final_detections.append(det)
 
-    def _check_temporal_consistency(self, cls: str, current_bbox: list) -> bool:
-        """Check if detection is consistent with recent history (same area)"""
-        if cls not in self.frame_history:
-            self.frame_history[cls] = []
-        
-        history = self.frame_history[cls]
-        x1, y1, x2, y2 = current_bbox
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
-        area = (x2 - x1) * (y2 - y1)
-        
-        # Need at least 2 consistent frames out of last 3
-        consistent_count = 0
-        required_matches = 2
-        
-        for prev_bbox in history:
-            px1, py1, px2, py2 = prev_bbox
-            p_center_x = (px1 + px2) / 2
-            p_center_y = (py1 + py2) / 2
-            p_area = (px2 - px1) * (py2 - py1)
-            
-            # Check spatial overlap (centers within 50 pixels)
-            center_dist = ((center_x - p_center_x)**2 + (center_y - p_center_y)**2)**0.5
-            area_ratio = min(area, p_area) / max(area, p_area) if max(area, p_area) > 0 else 0
-            
-            # Consider consistent if centers are close AND sizes are similar
-            if center_dist < 50 and area_ratio > 0.5:
-                consistent_count += 1
-        
-        # Update history (keep last 3 frames)
-        history.append(current_bbox)
-        if len(history) > 3:
-            history.pop(0)
-        
-        # Require at least 2 consistent detections (current + 1 previous)
-        return consistent_count >= required_matches - 1
+        return final_detections
 
-    def _run(self, model_name, frame):
-        results = self.models[model_name](frame, verbose=False, conf=0.30, iou=0.45, device=self.device)
-        return self._parse(results, model_name)
-
-    def _run_cascade(self, frame):
-        dets = self._run("default", frame)
-        # Skip cascade if too slow; just use filtered default
-        return dets
-
-    def _parse(self, results, model_name):
-        dets = []
-        for r in results:
-            for box in r.boxes:
-                cls = self.class_names[model_name][int(box.cls[0])].lower()
-                conf = float(box.conf[0])
-                if cls in self.target_classes:
-                    dets.append({
-                        "class": cls,
-                        "confidence": conf,
-                        "bbox": list(map(int, box.xyxy[0]))
-                    })
-        
-        # Apply NMS to remove duplicate detections of same object
-        if dets:
-            dets = self._apply_nms(dets)
-        
-        return dets
-
-    def _apply_nms(self, detections, iou_threshold=0.5):
-        """Remove duplicate detections of the same object"""
-        if not detections:
+    def _run_model(self, model_name: str, frame: np.ndarray):
+        """Run a single model and parse results."""
+        if model_name not in self.models:
             return []
         
-        # Group by class
-        by_class = defaultdict(list)
-        for det in detections:
-            by_class[det["class"]].append(det)
-        
-        final = []
-        for cls, cls_dets in by_class.items():
-            # Sort by confidence (highest first)
-            cls_dets.sort(key=lambda x: x["confidence"], reverse=True)
-            
-            kept = []
-            while cls_dets:
-                # Keep highest confidence detection
-                best = cls_dets.pop(0)
-                kept.append(best)
-                
-                # Remove overlapping detections
-                cls_dets = [d for d in cls_dets if self._iou(best["bbox"], d["bbox"]) < iou_threshold]
-            
-            final.extend(kept)
-        
-        return final
+        try:
+            results = self.models[model_name](
+                frame, 
+                verbose=False, 
+                conf=0.30,  # Low threshold here; we filter strictly later
+                iou=0.45, 
+                device=self.device,
+                max_det=100  # Limit detections per frame for speed
+            )
+            return self._parse_results(results, model_name)
+        except Exception as e:
+            print(f"⚠️ Detection error in {model_name}: {e}")
+            return []
 
-    def _iou(self, box1, box2):
-        """Calculate Intersection over Union"""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection
-        
-        return intersection / union if union > 0 else 0
+    def _parse_results(self, results, model_name: str):
+        """Parse YOLO results into standardized detection format."""
+        detections = []
+        for r in results:
+            for box in r.boxes:
+                try:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    cls_name = self.class_names[model_name][cls_id].lower()
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    
+                    detections.append({
+                        "class": cls_name,
+                        "confidence": conf,
+                        "bbox": [x1, y1, x2, y2]
+                    })
+                except (IndexError, ValueError, KeyError):
+                    continue  # Skip malformed boxes
+        return detections
+
+    def switch_mode(self, mode: str):
+        """Live-switch detection mode without restarting."""
+        if mode in ["default", "custom", "cascade"]:
+            self.active_mode = mode
+            print(f"🔄 Switched to {mode.upper()} mode")
+        else:
+            print(f"⚠️ Unknown mode: {mode}")
