@@ -1,4 +1,4 @@
-# 🦁 Wildlife Conflict Mitigation System
+# Wildlife Conflict Mitigation System  OR  USe  Unknown Object Detection
 
 A dual-model YOLO-based wildlife detection and alert system designed to prevent human-wildlife conflicts by detecting animals in restricted areas and triggering real-time alerts.
 
