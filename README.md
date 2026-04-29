@@ -23,7 +23,7 @@ A dual-model YOLO-based wildlife detection and alert system designed to prevent 
 
 1. **Clone the repository**:
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/uyg7x/ReaLTimEDe.git
 cd RTWAD
 ```
 
